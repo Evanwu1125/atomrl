@@ -79,7 +79,7 @@ class GRPOTrainer:
 
         # 加载system prompt
         
-        with open('/workspace/minimind/reproduce/algorithms/grpo/prompt.txt', 'r', encoding='utf-8') as f:
+        with open('prompt.txt', 'r', encoding='utf-8') as f:
             self.system_prompt = f.read().strip()
         print(f"[INFO] Loaded system prompt: {self.system_prompt}")
 
@@ -477,11 +477,11 @@ def main():
     args = GRPOArgs()
     accelerator = Accelerator()
 
-    model_path = '/workspace/minimind/reproduce/weights/qwen2.5-1.5b-instruct'
-    tokenizer_path = '/workspace/minimind/reproduce/weights/qwen2.5-1.5b-instruct'
+    model_path = ''
+    tokenizer_path = ''
 
-    gsm8k_train_dataset = load_dataset('/workspace/minimind/reproduce/datasets/gsm8k/main', split='train')
-    gsm8k_eval_dataset = load_dataset('/workspace/minimind/reproduce/datasets/gsm8k/main', split='test')
+    gsm8k_train_dataset = load_dataset('gsm8k', split='train')
+    gsm8k_eval_dataset = load_dataset('gsm8k', split='test')
 
     reward_functions = [
         correctness_reward,
