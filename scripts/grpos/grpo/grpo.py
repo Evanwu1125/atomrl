@@ -299,7 +299,8 @@ class GRPOTrainer:
         outputs = model(
             input_ids = prompt_response_ids,
             attention_mask = attention_mask,
-        )
+            logits_to_keep = response_mask.shape[1]+1 # 2025-06-30添加，修复了-num_actions大于response_length的bug
+        ) 
         logits = outputs.logits
         log_probs = F.log_softmax(logits, dim=-1)
         
