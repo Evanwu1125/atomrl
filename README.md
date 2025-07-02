@@ -140,6 +140,7 @@ atomrl/
 
 ### 即将支持的算法
 - [ ] PPO (Proximal Policy Optimization)
+- [x] DAPO (Decoupled Clip and Dynamic sAmpling Policy Optimization)
 - [ ] DPO (Direct Preference Optimization)  
 - [ ] RLHF (Reinforcement Learning from Human Feedback)
 - [ ] A2C (Advantage Actor-Critic)
@@ -150,7 +151,7 @@ atomrl/
 - [ ] 可视化界面
 - [ ] 实验记录和对比
 - [ ] 自动超参数调优
-- [-] 分布式训练优化
+- [x] 分布式训练优化
 
 ## 🤝 贡献指南
 
