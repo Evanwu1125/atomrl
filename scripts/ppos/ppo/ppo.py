@@ -219,7 +219,19 @@ class PPOTrainer:
                 input_ids = prompt_response_ids,
                 attention_mask = attention_mask,
             )
-            logits = output.logits
+            logits = output.logits 
+            # logits的形状是(batch_size, sequence_length, vocab_size)
+
+            response_logits = logits[:, :-1, :]
+            # 获取response部分的logits（去掉最后一个token的logits)
+
+            '''
+            位置:     0   1   2   3   4   5   6
+            tokens:  [Q1, Q2, Q3, R1, R2, R3, PAD]
+            logits:  [L0, L1, L2, L3, L4, L5, L6]
+            logits[:, :-1, :] = [L0, L1, L2, L3, L4, L5]
+            logits[:, 1:, :] = [L1, L2, L3, L4, L5, L6]
+            '''
             log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
             log_probs_labels = log_probs.gather(dim=-1, index=prompt_response_ids[:, 1:].unsqueeze(-1))
             action_log_probs = log_probs_labels.squeeze(-1)[:, -action_mask.size(1):]
