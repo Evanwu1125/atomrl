@@ -108,7 +108,7 @@ class PPOTrainer:
         # load the train dataset
         assert train_dataset is not None, "train_dataset is required"
         self.train_dataset = DataLoader(
-            self.train_dataset,
+            train_dataset,
             batch_size = self.args.batch_size,
             shuffle = True,
         )
@@ -116,15 +116,110 @@ class PPOTrainer:
         # load the eval dataset
         assert eval_dataset is not None, "eval_dataset is required"
         self.eval_dataset = DataLoader(
-            self.eval_dataset,
+            eval_dataset,
             batch_size = self.args.batch_size,
             shuffle = False,
+        )
+        
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr = self.args.lr,
+            weight_decay=0.01
         )
 
         self.model, self.optimizer, self.train_dataloader, self.eval_dataloader = self.accelerator.prepare(
             self.model, self.optimizer, self.train_dataloader, self.eval_dataloader
         )
 
-    def 
+    def generate_samples(self, batch):
+        """
+        传统ppo的方式生成样本，每个提示词只生成一个响应
+        Args:
+            batch: 批次数据
+        Returns:
+            samples: 一个batch的样本
+        """
+        self.model.eval()
 
+        prompts = batch.get('question')
+
+        prompt_text = []
+        for prompt in prompts:
+            # 应用聊天摸版
+            input_text = self.tokenizer.apply_chat_template(
+                [
+                    {"role" : "system", "content":self.system_prompt},
+                    {"role" : "user", "content": prompt}
+                ],
+                add_generation_prompt = True,
+                tokenize = False # 这里不做tokenize是可以留到后面做批处理的tokenize
+            )
+            prompt_text.append(input_text)
+
+        inputs = self.tokenizer(
+            prompt_text,
+            return_tensors = 'pt',
+            padding = 'max_length', # 按照设置的最大句子长度做padding
+            max_length = self.args.max_prompt_length,
+            truncation = True,
+        ).to(self.args.device)
+
+        prompt_length = inputs['input_ids'].shape[1] 
+        # inputs['input_ids']的形状是(batch_size, sequence_length)
+
+        with torch.no_grad():
+            prompt_response_ids = self.model.generate(
+                **inputs, # 这里在inputs前面加上**是因为要同时把input_id和attention_mask输入
+                max_new_tokens = self.args.max_generate_length,
+                pad_token_id = self.tokenizer.pad_token_id,
+                eos_token_id = self.tokenizer.eos_token_id,
+                do_sample = True,
+                temperature = 1.0,
+                top_p = 0.95,
+            )
         
+        response_ids = prompt_response_ids[:, prompt_length:]
+        # 只保留了模型回复的部分
+        attention_mask = (prompt_response_ids != self.tokenizer.pad_token_id).long()
+        # 把input_id中的padding token全部过滤掉
+
+        # 创建action_mask
+        is_not_pad = response_ids != self.tokenizer.pad_token_id
+        is_not_eos = response_ids != self.tokenizer.eos_token_id
+        action_mask = (is_not_pad & is_not_eos).long()
+        # action_mask的形状是(batch_size, response_length)
+
+        # 计算response长度
+        response_length = action_mask.float().sum(dim=-1)
+        total_length = attention_mask.float().sum(dim=-1)
+
+        samples = Samples(
+            prompt_response_ids = prompt_response_ids,
+            attention_mask = attention_mask,
+            action_mask = action_mask,
+            num_actions = action_mask.size(1),
+            response_ids = response_ids,
+            total_length = total_length,
+        )
+
+        return samples
+
+    def get_action_log_probs(self, model, prompt_response_ids,
+                             attention_mask, action_mask):
+        """
+        计算模型输出token的log概率
+        args:
+            model: 要计算的模型
+            prompt_response_ids: prompt + response的token_ids
+            attention_mask: prompt + response中所有有效token的掩码
+            action_mask: 动作掩码
+        """
+        with torch.no_grad():
+            output = model(
+                input_ids = prompt_response_ids,
+                attention_mask = attention_mask,
+            )
+            logits = output.logits
+            log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
+            log_probs_labels = log_probs.gather(dim=-1, index=prompt_response_ids[:, 1:].unsqueeze(-1))
+            action_log_probs = log_probs_labels.squeeze(-1)[:, -action_mask.size(1):]
