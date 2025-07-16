@@ -150,28 +150,7 @@ class PPOTrainer:
         """
         self.model.eval()
 
-        prompts = batch.get('question')
-
-        prompt_text = []
-        for prompt in prompts:
-            # 应用聊天摸版
-            input_text = self.tokenizer.apply_chat_template(
-                [
-                    {"role" : "system", "content":self.system_prompt},
-                    {"role" : "user", "content": prompt}
-                ],
-                add_generation_prompt = True,
-                tokenize = False # 这里不做tokenize是可以留到后面做批处理的tokenize
-            )
-            prompt_text.append(input_text)
-
-        inputs = self.tokenizer(
-            prompt_text,
-            return_tensors = 'pt',
-            padding = 'max_length', # 按照设置的最大句子长度做padding
-            max_length = self.args.max_prompt_length,
-            truncation = True,
-        ).to(self.args.device)
+        inputs, prompts = self._prepare_prompts(batch)
 
         prompt_length = inputs['input_ids'].shape[1] 
         # inputs['input_ids']的形状是(batch_size, sequence_length)
@@ -213,7 +192,41 @@ class PPOTrainer:
 
         return samples
 
-    def get_action_log_probs(self, model, prompt_response_ids,
+    def _prepare_prompts(self, batch):
+        """
+        准备prompt文本并进行tokenize
+        args:
+            batch: 一批数据
+        returns:
+            inputs: tokenize后的结果
+            prompts: 原始的prompt列表
+        """
+        prompts = batch.get('question')
+
+        prompt_text = []
+        for prompt in prompts:
+            # 应用聊天摸版
+            input_text = self.tokenizer.apply_chat_template(
+                [
+                    {"role" : "system", "content":self.system_prompt},
+                    {"role" : "user", "content": prompt}
+                ],
+                add_generation_prompt = True,
+                tokenize = False # 这里不做tokenize是可以留到后面做批处理的tokenize
+            )
+            prompt_text.append(input_text)
+
+        inputs = self.tokenizer(
+            prompt_text,
+            return_tensors = 'pt',
+            padding = 'max_length', # 按照设置的最大句子长度做padding
+            max_length = self.args.max_prompt_length,
+            truncation = True,
+        ).to(self.args.device)
+
+        return inputs, prompts
+
+    def _get_action_log_probs(self, model, prompt_response_ids,
                              attention_mask, action_mask):
         """
         计算模型输出token的log概率
@@ -259,7 +272,24 @@ class PPOTrainer:
         postprocessed_response = response.clone() 
         # postprocessed_response的形状是
 
-        
+        if hasattr(self, 'stop_token_id') and self.stop_token_id is not None:
+            for i in range(postprocessed_response.shape[0]):
+                eos_indices = (postprocessed_response[i] == self.stop_token_id).nonzero(as_tuple = True)[0]
+                # nonzero(as_tuple = True)[0] 是以元组的形式返回所有的eos token对应的索引
+                if len(eos_indices) > 0:
+                    first_eos = eos_indices[0].item() #取出第一个eos token的位置
+                    postprocessed_response[i, first_eos+1:] = self.tokenizer.pad_token_id
+                    
+        sequence_lengths = [] # 列表，长度为batch_size
+        for i in range(postprocessed_response.shape[0]):
+            pad_indices = (postprocessed_response[i] == self.tokenizer.pad_token_id).nonzero(as_tuple = True)[0]
+            if len(pad_indices) > 0:
+                sequence_lengths.append(pad_indices[0].item()) # 取出第一个pad token的位置
+            else:
+                sequence_lengths.append(postprocessed_response.shape[1]) # 没有pad token，则整个序列都是有效的
+        sequence_lengths = torch.tensor(sequence_lengths, dtype=torch.long, device=self.args.device)
+        return postprocessed_response, sequence_lengths
+
 
     def _compute_reward_scores(self, postprocessed_query_response, context_length):
         
