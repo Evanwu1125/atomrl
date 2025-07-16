@@ -86,6 +86,15 @@ class PPOTrainer:
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        # 设置stop token id来让模型输出正常的长度
+        if hasattr(self.args, 'stop_token_id') and self.args.stop_token_id is not None:
+            self.stop_token_id = self.args.stop_token_id
+        elif hasattr(self.args, 'stop_token') and self.args.stop_token == "eos":
+            self.stop_token_id = self.tokenizer.eos_token_id
+        else:
+            # 默认使用eos token作为stop token
+            self.stop_token_id = self.tokenizer.eos_token_id
+
         # 加载system prompt
         with open('/workspace/minimind/reproduce/algorithms/PPO/prompt.txt', 'r', encoding='utf-8') as f:
             self.system_prompt = f.read().strip()
@@ -234,4 +243,23 @@ class PPOTrainer:
             '''
             log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
             log_probs_labels = log_probs.gather(dim=-1, index=prompt_response_ids[:, 1:].unsqueeze(-1))
-            action_log_probs = log_probs_labels.squeeze(-1)[:, -action_mask.size(1):]
+            action_log_probs = log_probs_labels.squeeze(-1)[:, -(action_mask.size(1)-1):]
+
+        return action_log_probs
+    
+    def _postprocess_response(self, response):
+        """
+        对响应进行后处理，截断stop token
+        Args:
+            response: 原始响应, 形状: (batch_size, max_generate_length)
+        Returns:
+            postprocessed_response: 后处理的响应, 形状: (batch_size, max_generate_length)
+            sequence_lengths: 每个序列的有效长度, 彩色: (batch_size,)
+        """
+        postprocessed_response = response.clone() 
+        # postprocessed_response的形状是
+
+        
+
+    def _compute_reward_scores(self, postprocessed_query_response, context_length):
+        
