@@ -12,10 +12,11 @@ from reward_func import *
 import torch.nn.functional as F
 import os
 import json
+from reward_func import *
 import datetime
 import deepspeed
 from accelerate import Accelerator
-
+from trl import GRPOTrainer
 @dataclass
 class Samples:
     prompt_response_ids: torch.Tensor
@@ -79,7 +80,7 @@ class GRPOTrainer:
 
         # 加载system prompt
         
-        with open('prompt.txt', 'r', encoding='utf-8') as f:
+        with open('/workspace/minimind/reproduce/algorithms/grpo/prompt.txt', 'r', encoding='utf-8') as f:
             self.system_prompt = f.read().strip()
         print(f"[INFO] Loaded system prompt: {self.system_prompt}")
 
@@ -183,6 +184,9 @@ class GRPOTrainer:
             # d. 处理输出
             # response_ids指的是模型的回复
             response_ids = prompt_response_ids[:, prompt_len:]
+            # 加上对response的后处理代码
+            response_ids = self._postprocess_response(response_ids)
+
             # attention_mask指的是模型的回复是否有padding
             attention_mask = (prompt_response_ids != self.tokenizer.pad_token_id).long()
 
@@ -228,7 +232,7 @@ class GRPOTrainer:
             answer_texts = [samples.answer] * num_responses
 
             rewards = torch.zeros(num_responses, device=self.args.device)
-            named_rewards = {}  # 新增
+            named_rewards = {}  
 
             for reward_func in self.reward_funcs:
                 reward_values = reward_func(
@@ -299,8 +303,8 @@ class GRPOTrainer:
         outputs = model(
             input_ids = prompt_response_ids,
             attention_mask = attention_mask,
-            logits_to_keep = response_mask.shape[1]+1 # 2025-06-30添加，修复了-num_actions大于response_length的bug
-        ) 
+            logits_to_keep = num_actions + 1,
+        ) # num_actions就是response的长度
         logits = outputs.logits
         log_probs = F.log_softmax(logits, dim=-1)
         
@@ -361,6 +365,25 @@ class GRPOTrainer:
 
         loss = (policy_loss.sum(dim=1) / action_mask.sum(dim=1)).mean()
         return loss
+
+    def _postprocess_response(self, response_ids):
+        """
+        对响应进行后处理，截断stop token
+        Args:
+            response: 原始响应, 形状: (batch_size, max_generate_length)
+        Returns:
+            postprocessed_response: 后处理的响应, 形状: (batch_size, max_generate_length)
+            sequence_lengths: 每个序列的有效长度, 彩色: (batch_size,)
+        """
+        postprocessed_response = response_ids.clone()
+
+        for i in range(postprocessed_response.shape[0]):
+            eos_indices = (postprocessed_response[i] == self.tokenizer.eos_token_id).nonzero(as_tuple=True)[0]
+            if len(eos_indices) > 0:
+                first_eos = eos_indices[0].item()
+                postprocessed_response[i, first_eos+1:] = self.tokenizer.pad_token_id
+
+        return postprocessed_response
 
     def train_step(self, batch, global_step=None, rollout_log_file=None):
         '''
@@ -481,8 +504,8 @@ def main():
     model_path = ''
     tokenizer_path = ''
 
-    gsm8k_train_dataset = load_dataset('gsm8k', split='train')
-    gsm8k_eval_dataset = load_dataset('gsm8k', split='test')
+    gsm8k_train_dataset = load_dataset('', split='train')
+    gsm8k_eval_dataset = load_dataset('', split='test')
 
     reward_functions = [
         correctness_reward,
