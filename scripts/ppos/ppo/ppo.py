@@ -150,31 +150,36 @@ class PPOTrainer:
         """
         self.model.eval()
 
+        # 1. 准备prompt
         inputs, prompts = self._prepare_prompts(batch)
 
-        prompt_length = inputs['input_ids'].shape[1] 
-        # inputs['input_ids']的形状是(batch_size, sequence_length)
+        # 2. 生成response
+        """
+        response_ids是指模型返回的response
+        response_length是指模型返回的response的有效长度
+        context_length是指prompt的长度
+        """
+        prompt_response_ids, response_ids, context_length = self._generate_responses(inputs)
 
-        with torch.no_grad():
-            prompt_response_ids = self.model.generate(
-                **inputs, # 这里在inputs前面加上**是因为要同时把input_id和attention_mask输入
-                max_new_tokens = self.args.max_generate_length,
-                pad_token_id = self.tokenizer.pad_token_id,
-                eos_token_id = self.tokenizer.eos_token_id,
-                do_sample = True,
-                temperature = 1.0,
-                top_p = 0.95,
-            )
+        # 3. postprocess_response
+        """
+        postprocessed_responses是指做出后处理的response
+        （后处理的方式是把第一个eos token后面的所有token都换成padding token的处理）
+        sequence_lengths是指postprocessed_responses的有效长度
+        （这个长度是记录了第一个pad token的索引，这个索引的数值刚好可以对应有效长度）
+        """
+        postprocessed_responses, sequence_lengths = self._postprocess_response(response=response_ids)
         
-        response_ids = prompt_response_ids[:, prompt_length:]
-        # 只保留了模型回复的部分
-        attention_mask = (prompt_response_ids != self.tokenizer.pad_token_id).long()
-        # 把input_id中的padding token全部过滤掉
+        # 4. 创建 mask
+        """
+        attention_mask - > prompt_response_ids
+        action_mask - > reponse_ids
+        """
+        attention_mask, action_mask, padding_mask, padding_mask_p1 = self._create_masks(prompt_response_ids, response_ids, sequence_lengths)
 
-        # 创建action_mask
-        is_not_pad = response_ids != self.tokenizer.pad_token_id
-        is_not_eos = response_ids != self.tokenizer.eos_token_id
-        action_mask = (is_not_pad & is_not_eos).long()
+        # 5. 分批处理计算概率和分数
+        logprobs, ref_logprobs, values, scores = self._batch_process_samples(prompt)
+
         # action_mask的形状是(batch_size, response_length)
 
         # 计算response长度
@@ -270,7 +275,7 @@ class PPOTrainer:
             sequence_lengths: 每个序列的有效长度, 彩色: (batch_size,)
         """
         postprocessed_response = response.clone() 
-        # postprocessed_response的形状是
+        # postprocessed_response的形状是（batch_size, max_generate_length)
 
         if hasattr(self, 'stop_token_id') and self.stop_token_id is not None:
             for i in range(postprocessed_response.shape[0]):
@@ -290,6 +295,66 @@ class PPOTrainer:
         sequence_lengths = torch.tensor(sequence_lengths, dtype=torch.long, device=self.args.device)
         return postprocessed_response, sequence_lengths
 
+    def _generate_responses(self, inputs):
+        """
+        生成模型响应
+        args:
+            inputs: tokenize后的所有prompt的长度
+        returns:
+            prompt_reponse_ids: prompt+response的长度, 形状: (batch_size, total_length)
+            response_ids: 模型的回答长度
+            response_length: 每个响应的有效长度, 形状: (batch_size,)
+        """
+        context_length = inputs['input_ids'].shape[1]
 
+        with torch.no_grad():
+            prompt_response_ids = self.model.generate(
+                **inputs,
+                max_new_tokens = self.args.max_generate_length,
+                pad_token_id = self.tokenizer.pad_token_id,
+                eos_token_id = self.tokenizer.eos_token_id,
+                do_sample = True,
+                temperature = 1.0,
+                top_p = 0.95,
+            )
+        
+        #response_ids是指模型生成的回答长度
+        response_ids = prompt_response_ids[:, context_length:]
+        
+        return prompt_response_ids, response_ids, context_length
+    def _create_masks(self, prompt_response_ids, responses_ids, sequence_lengths):
+        """
+        创建各种掩码
+        Args:
+            prompt_response_ids: prompt + response的内容
+            responses_ids: 模型的回答
+            sequence_lengths: 每个响应的有效长度(做过postprocess之后的长度，就是到第一个pad token的长度)
+        Returns:
+            attention_mask: prompt + response中所有有效token的掩码
+            action_mask: 动作掩码
+            padding_mask: padding掩码
+            padding_mask_p1: padding掩码 + 1
+        """
+        
+        attention_mask = (prompt_response_ids != self.tokenizer.pad_token_id).long()
+
+        # 创建动作掩码
+        is_not_pad = responses_ids != self.tokenizer.pad_token_id
+        is_not_eos = responses_ids != self.tokenizer.eos_token_id
+        action_mask = (is_not_pad & is_not_eos).long()
+
+        # 创建padding掩码
+        response_idxs = torch.arange(responses_ids.shape[1], device=responses_ids.device).repeat(responses_ids.shape[0],1)
+        # 形状是 (batch_size, max_generate_length)
+
+        padding_mask = response_idxs >= sequence_lengths.unsqueeze(1)
+        # 形状是 (batch_size, max_generate_length)
+
+        padding_mask_p1 = response_idxs >= (sequence_lengths + 1).unsqueeze(1)
+        # 形状是 (batch_size, max_generate_length)
+        # 之所以这里 + 1是因为价值函数预测需要预测t+1位置的价值
+
+        return attention_mask, action_mask, padding_mask, padding_mask_p1
+    
     def _compute_reward_scores(self, postprocessed_query_response, context_length):
         
