@@ -16,7 +16,8 @@ from reward_func import *
 import datetime
 import deepspeed
 from accelerate import Accelerator
-from trl import GRPOTrainer
+# from trl import GRPOTrainer
+
 @dataclass
 class Samples:
     prompt_response_ids: torch.Tensor
@@ -109,9 +110,6 @@ class GRPOTrainer:
 
         #define the optimizer
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.lr)
-        if self.args.beta != 0.0:
-            self.ref_model = deepcopy(model)
-            self.ref_model.eval()
 
         self.train_dataloader = DataLoader(
             self.train_dataset,
@@ -294,17 +292,19 @@ class GRPOTrainer:
             model: PreTrainedModel,
             prompt_response_ids: torch.Tensor,
             attention_mask: torch.Tensor,
-            response_mask: torch.Tensor,
+            action_mask: torch.Tensor,
     ):
         '''
         计算给定模型下，一个序列中 response 部分的 token 对数概率
         '''
 
-        outputs = model(
-            input_ids = prompt_response_ids,
-            attention_mask = attention_mask,
-            logits_to_keep = num_actions + 1,
-        ) # num_actions就是response的长度
+        num_actions = action_mask.shape[1]
+        with torch.no_grad():
+            outputs = model(
+                input_ids = prompt_response_ids,
+                attention_mask = attention_mask,
+                # logits_to_keep = num_actions + 1,
+            ) # num_actions就是response的长度
         logits = outputs.logits
         log_probs = F.log_softmax(logits, dim=-1)
         
@@ -316,8 +316,7 @@ class GRPOTrainer:
         ).squeeze(-1)
 
         # 应用掩码，保留有效token的部分
-        num_actions = response_mask.shape[1]
-        action_log_probs = log_probs_for_labels[:, -num_actions:]
+        action_log_probs = log_probs_for_labels[:, -(num_actions-1):]
 
         return action_log_probs
     
@@ -341,7 +340,7 @@ class GRPOTrainer:
         ratio = torch.exp(log_ratio)
 
         # 3. 计算优势函数
-        advantages_expand = advantages.unsqueeze(-1)
+        advantages_expand = advantages.unsqueeze(-1).expand_as(action_mask)
 
         # 计算两个版本的损失
         loss1 = ratio * advantages_expand
@@ -353,7 +352,7 @@ class GRPOTrainer:
 
         policy_loss = -torch.min(loss1, loss2)
 
-        policy_loss = policy_loss * action_mask
+        policy_loss = policy_loss * action_mask.float()
 
         # 4. 计算KL散度损失
         if self.args.beta != 0.0 and 'ref_log_probs' in experience:
@@ -361,9 +360,9 @@ class GRPOTrainer:
             log_kl_ratio = ref_action_log_probs - current_action_log_probs
             kl_penalty = log_kl_ratio.exp() - 1 - log_kl_ratio
             
-            policy_loss += self.args.beta * (kl_penalty * action_mask)
+            policy_loss += self.args.beta * (kl_penalty * action_mask.float())
 
-        loss = (policy_loss.sum(dim=1) / action_mask.sum(dim=1)).mean()
+        loss = (policy_loss.sum(dim=1) / action_mask.sum(dim=1).clamp(min=1)).mean()
         return loss
 
     def _postprocess_response(self, response_ids):
@@ -389,6 +388,7 @@ class GRPOTrainer:
         '''
         单步训练
         '''
+        self.model.train()
         experience = self.generate_experience(batch)
         loss = self._compute_loss(experience)
         self.accelerator.backward(loss)
@@ -501,11 +501,11 @@ def main():
     args = GRPOArgs()
     accelerator = Accelerator()
 
-    model_path = ''
-    tokenizer_path = ''
+    model_path = '/workspace/minimind/reproduce/weights/qwen2.5-1.5b-instruct'
+    tokenizer_path = '/workspace/minimind/reproduce/weights/qwen2.5-1.5b-instruct'
 
-    gsm8k_train_dataset = load_dataset('', split='train')
-    gsm8k_eval_dataset = load_dataset('', split='test')
+    gsm8k_train_dataset = load_dataset('/workspace/minimind/reproduce/datasets/gsm8k/main', split='train')
+    gsm8k_eval_dataset = load_dataset('/workspace/minimind/reproduce/datasets/gsm8k/main', split='test')
 
     reward_functions = [
         correctness_reward,
