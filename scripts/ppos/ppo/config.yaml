@@ -1,0 +1,41 @@
+compute_environment: LOCAL_MACHINE
+debug: true
+distributed_type: DEEPSPEED
+deepspeed_config:
+  train_batch_size: 16
+  gradient_accumulation_steps: 2
+  fp16:
+    enabled: true
+  zero_optimization:
+    stage: 3
+    offload_optimizer: none
+    offload_param: none
+    overlap_comm: true
+    contiguous_gradients: true
+    reduce_bucket_size: 5e8
+    stage3_prefetch_bucket_size: 5e8
+    stage3_param_persistence_threshold: 1e6
+    sub_group_size: 1e9
+    stage3_max_live_parameters: 1e9
+    stage3_max_reuse_distance: 1e9
+  activation_checkpointing:
+    partition_activations: true
+    cpu_checkpointing: true
+    contiguous_memory_optimization: true
+    number_checkpoints: 1
+  wall_clock_breakdown: false
+  train_micro_batch_size_per_gpu: 1
+downcast_bf16: 'no'
+enable_cpu_affinity: false
+gpu_ids: all
+machine_rank: 0
+main_training_function: main
+mixed_precision: fp16
+num_machines: 1
+num_processes: 8
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
