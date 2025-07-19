@@ -322,6 +322,7 @@ class PPOTrainer:
         response_ids = prompt_response_ids[:, context_length:]
         
         return prompt_response_ids, response_ids, context_length
+    
     def _create_masks(self, prompt_response_ids, responses_ids, sequence_lengths):
         """
         创建各种掩码
