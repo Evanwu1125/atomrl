@@ -147,6 +147,12 @@ class PPOTrainer:
             batch: 批次数据
         Returns:
             samples: 一个batch的样本
+        get_action_log_probs: ✅
+        prepare_prompts: ✅
+        generate_responses: ✅
+        postprocess_response: ✅
+        create_masks: ✅
+        batch_process_samples: ✅
         """
         self.model.eval()
 
@@ -157,7 +163,7 @@ class PPOTrainer:
         """
         response_ids是指模型返回的response
         response_length是指模型返回的response的有效长度
-        context_length是指prompt的长度
+        context_length是指prompt的最大长度
         """
         prompt_response_ids, response_ids, context_length = self._generate_responses(inputs)
 
@@ -178,7 +184,7 @@ class PPOTrainer:
         attention_mask, action_mask, padding_mask, padding_mask_p1 = self._create_masks(prompt_response_ids, response_ids, sequence_lengths)
 
         # 5. 分批处理计算概率和分数
-        logprobs, ref_logprobs, values, scores = self._batch_process_samples(prompt)
+        logprobs, ref_logprobs, values, scores = self._batch_process_samples(self, )
 
         # action_mask的形状是(batch_size, response_length)
 
@@ -259,7 +265,7 @@ class PPOTrainer:
             logits[:, :-1, :] = [L0, L1, L2, L3, L4, L5]
             logits[:, 1:, :] = [L1, L2, L3, L4, L5, L6]
             '''
-            log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
+            log_probs = F.log_softmax(response_logits, dim=-1)
             log_probs_labels = log_probs.gather(dim=-1, index=prompt_response_ids[:, 1:].unsqueeze(-1))
             action_log_probs = log_probs_labels.squeeze(-1)[:, -(action_mask.size(1)-1):]
 
@@ -269,9 +275,9 @@ class PPOTrainer:
         """
         对响应进行后处理，截断stop token
         Args:
-            response: 原始响应, 形状: (batch_size, max_generate_length)
+            response: 原始响应, 形状: (batch_size, actual_length)
         Returns:
-            postprocessed_response: 后处理的响应, 形状: (batch_size, max_generate_length)
+            postprocessed_response: 后处理的响应, 形状: (batch_size, actual_length)
             sequence_lengths: 每个序列的有效长度, 彩色: (batch_size,)
         """
         postprocessed_response = response.clone() 
@@ -311,7 +317,7 @@ class PPOTrainer:
             prompt_response_ids = self.model.generate(
                 **inputs,
                 max_new_tokens = self.args.max_generate_length,
-                pad_token_id = self.tokenizer.pad_token_id,
+                pad_token_id = self.tokenizer.pad_token_id, # 设置pad_token_id虽然不会自动填充，但是可以保证模型不去采样padding token
                 eos_token_id = self.tokenizer.eos_token_id,
                 do_sample = True,
                 temperature = 1.0,
@@ -357,5 +363,26 @@ class PPOTrainer:
 
         return attention_mask, action_mask, padding_mask, padding_mask_p1
     
+    def _bacth_process_samples(self, prompt_response_ids, responses_ids, postprocessed_responses_ids, attention_mask, context_length):
+        """
+        批量处理样本
+        Args:
+            prompt_response_ids: prompt + response的总输出
+            response_ids: 光是模型的输出
+            postprocessed_responses: 经过后处理的response
+            attention_mask: prompt + response中所有有效token的掩码
+            context_length: max_prompt的大小
+        Returns:
+            logprobs: 模型输出token的log概率
+            ref_logprobs: 引用模型输出token的log概率
+            values: 价值函数的输出
+            scores: 奖励函数的输出
+        """
+        logprobs = []
+        ref_logprobs = []
+        values = []
+        scores = []
+
+        
     def _compute_reward_scores(self, postprocessed_query_response, context_length):
         
