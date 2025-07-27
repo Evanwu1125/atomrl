@@ -363,6 +363,71 @@ class PPOTrainer:
 
         return attention_mask, action_mask, padding_mask, padding_mask_p1
     
+    def _compute_policy_log_probs(self, prompt_response_ids_subbatch, attention_mask_subbatch, response_ids_subbatch, context_length):
+        """
+        计算策略模型输出token的log概率
+        Args:
+            prompt_response_ids_subbatch: prompt + response的总输出
+            attention_mask_subbatch: prompt + response中所有有效token的掩码
+            response_ids_subbatch: 模型的回答
+            context_length: max_prompt的大小
+        Returns:
+            logprobs: 模型输出token的log概率
+        """
+        with torch.no_grad():
+            output = self.model(
+                input_ids = prompt_response_ids_subbatch,
+                attention_mask = attention_mask_subbatch,
+            )
+            logits = output.logits 
+            # logits的形状是(batch_size, sequence_length, vocab_size)
+
+            predict_logits = logits[:, context_length-1 : 1]
+            predict_logits /= (1.0+1e-7)
+            log_probs = F.log_softmax(predict_logits, dim=-1)
+            log_probs = log_probs.gather(2, response_ids_subbatch.unsqueeze(-1)).squeeze(-1)
+
+            return log_probs
+        
+    def _compute_ref_log_probs(self, prompt_response_ids_subbatch, attention_mask_subbatch, response_ids_subbatch, context_length):
+        """
+        计算参考模型的log模型
+        Args:
+            prompt_response_ids_subbatch: prompt + response的总输出
+            attention_mask_subbatch: prompt + response中所有有效token的掩码
+            response_ids_subbatch: 模型的回答
+            context_length: max_prompt的大小
+        Returns:
+            ref_logprobs: 参考模型输出token的log概率    
+        """
+        # 先判断是否有ref model
+        if self.args.beta == 0.0 or self.ref_model is None:
+            return None
+        
+        with torch.no_grad():
+            ref_output = self.ref_model(
+                input_ids = prompt_response_ids_subbatch,
+                attention_mask = attention_mask_subbatch,
+            )
+            ref_logits = ref_output.logits
+
+            ref_predict_logits = ref_logits[:, context_length-1 : 1]
+            ref_predict_logits /= (1.0+1e-7)
+            ref_log_probs = F.log_softmax(ref_predict_logits, dim=-1)
+            ref_log_probs = ref_log_probs.gather(2, response_ids_subbatch.unsqueeze(-1)).squeeze(-1)
+
+            return ref_log_probs
+
+    def _compute_values(self, prompt_response_ids_subbatch, attention_mask_subbatch, context_length):
+        """
+        计算价值函数的输出
+        Args:
+            prompt_response_ids_subbatch: prompt + response的总输出
+            attention_mask_subbatch: prompt + response中所有有效token的掩码
+            context_length: max_prompt的大小
+        Returns:
+            values: 价值函数的输出
+        """
     def _bacth_process_samples(self, prompt_response_ids, responses_ids, postprocessed_responses_ids, attention_mask, context_length):
         """
         批量处理样本
@@ -378,11 +443,35 @@ class PPOTrainer:
             values: 价值函数的输出
             scores: 奖励函数的输出
         """
-        logprobs = []
-        ref_logprobs = []
-        values = []
-        scores = []
+        logprobs_list = []
+        ref_logprobs_list = []
+        values_list = []
+        scores_list = []
+        for i in range(0, prompt_response_ids.shape[0]):
+            prompt_response_ids_subbatch = prompt_response_ids[i].unsqueeze(0)
+            responses_ids_subbatch = responses_ids[i].unsqueeze(0)
+            postprocessed_responses_ids_subbatch = postprocessed_responses_ids[i].unsqueeze(0)
+            attention_mask_subbatch = attention_mask[i].unsqueeze(0)
 
-        
-    def _compute_reward_scores(self, postprocessed_query_response, context_length):
+            # 计算各种概率和分数
+            logprobs = self._compute_policy_log_probs() # to be updated.    
+            ref_logprobs = self._compute_ref_log_probs()
+            values = self._compute_values()
+
+            # 计算reward
+            postprocessed_prompt_response_ids = torch.cat([
+                prompt_response_ids_subbatch[:, :context_length],
+                postprocessed_responses_ids_subbatch,
+            ], dim = 1)
+            scores = self._compute_reward_scores()
+
+            logprobs_list.append(logprobs)
+            if ref_logprobs is not None:
+                ref_logprobs_list.append(ref_logprobs)
+            values_list.append(values)
+            scores_list.append(scores)
+
+        return logprobs_list, ref_logprobs_list, values_list, scores_list
+    
+    def _compute_reward_scores(self, postprocessed_prompt_response_ids, context_length):
         
