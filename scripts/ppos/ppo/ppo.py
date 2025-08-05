@@ -16,7 +16,6 @@ from reward_func import *
 import datetime
 import deepspeed
 from accelerate import Accelerator
-from trl import PPOTrainer
 
 @dataclass
 class Samples:
