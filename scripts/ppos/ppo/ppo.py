@@ -12,7 +12,6 @@ from reward_func import *
 import torch.nn.functional as F
 import os
 import json
-from reward_func import *
 import datetime
 import deepspeed
 from accelerate import Accelerator
@@ -427,7 +426,22 @@ class PPOTrainer:
         Returns:
             values: 价值函数的输出
         """
-    def _bacth_process_samples(self, prompt_response_ids, responses_ids, postprocessed_responses_ids, attention_mask, context_length):
+        if not hasattr(self.model, 'value_head'):
+            self.model.value_head = nn.Linear(self.model.config.hidden_size, 1).to(self.args.device)
+        
+        with torch.no_grad():
+            output = self.model(
+                input_ids = prompt_response_ids_subbatch,
+                attention_mask = attention_mask_subbatch,
+                output_hidden_states=True
+            
+            )
+            hidden_states = output.hidden_states[-1]  # (batch_size, seq_len, hidden_size)
+            value_output = self.model.value_head(hidden_states)  # (batch_size, seq_len, 1)
+            values = value_output.squeeze(-1)  # (batch_size, seq_len)
+            response_values = values[:, context_length:]
+            return values
+    def _batch_process_samples(self, prompt_response_ids, responses_ids, postprocessed_responses_ids, attention_mask, context_length):
         """
         批量处理样本
         Args:
@@ -473,4 +487,11 @@ class PPOTrainer:
         return logprobs_list, ref_logprobs_list, values_list, scores_list
     
     def _compute_reward_scores(self, postprocessed_prompt_response_ids, context_length):
-        
+        """
+        计算奖励分数
+        Args:
+            postprocessed_prompt_response_ids: 后处理的prompt + response
+            context_length: prompt的长度
+        Returns:
+            scores: 奖励分数
+        """
