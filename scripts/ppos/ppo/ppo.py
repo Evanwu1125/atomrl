@@ -70,10 +70,6 @@ class PPOTrainer:
         if hasattr(self.model.config, 'attn_implementation'):
             self.model.config.attn_implementation = "flash_attention_2"
         
-        # 加载参考模型
-        self.ref_model = deepcopy(self.model)
-        self.ref_model.eval()
-        
         # 加载分词器
         assert tokenizer is not None, "tokenizer is required"
         tokenizer = AutoTokenizer.from_pretrained(tokenizer)
@@ -114,7 +110,7 @@ class PPOTrainer:
 
         # load the train dataset
         assert train_dataset is not None, "train_dataset is required"
-        self.train_dataset = DataLoader(
+        self.train_dataloader = DataLoader(
             train_dataset,
             batch_size = self.args.batch_size,
             shuffle = True,
@@ -122,7 +118,7 @@ class PPOTrainer:
 
         # load the eval dataset
         assert eval_dataset is not None, "eval_dataset is required"
-        self.eval_dataset = DataLoader(
+        self.eval_dataloader = DataLoader(
             eval_dataset,
             batch_size = self.args.batch_size,
             shuffle = False,
@@ -157,6 +153,7 @@ class PPOTrainer:
         # 1. 准备prompt
         inputs, prompts = self._prepare_prompts(batch)
 
+        answers = batch.get('answer', [None] * len(prompts))
         # 2. 生成response
         """
         response_ids是指模型返回的response
@@ -182,14 +179,22 @@ class PPOTrainer:
         attention_mask, action_mask, padding_mask, padding_mask_p1 = self._create_masks(prompt_response_ids, response_ids, sequence_lengths)
 
         # 5. 分批处理计算概率和分数
-        logprobs, ref_logprobs, values, scores = self._batch_process_samples(self, )
+        logprobs, ref_logprobs, values, scores = self._batch_process_samples(prompt_response_ids, response_ids, postprocessed_responses, attention_mask, context_length, answers)
 
         # action_mask的形状是(batch_size, response_length)
+
+        # 6. 计算advantage和回报
+        advantages, returns = self._compute_advantages_and_returns(
+            values_list = values,
+            scores_list = scores,
+            action_mask = action_mask
+        )
 
         # 计算response长度
         response_length = action_mask.float().sum(dim=-1)
         total_length = attention_mask.float().sum(dim=-1)
 
+        # 构建样本对象
         samples = Samples(
             prompt_response_ids = prompt_response_ids,
             attention_mask = attention_mask,
@@ -197,6 +202,12 @@ class PPOTrainer:
             num_actions = action_mask.size(1),
             response_ids = response_ids,
             total_length = total_length,
+            logprobs = logprobs,
+            ref_logprobs = ref_logprobs,
+            values=values,
+            rewards=scores,
+            advantages = advantages,
+            returns=returns,
         )
 
         return samples
@@ -380,7 +391,7 @@ class PPOTrainer:
             logits = output.logits 
             # logits的形状是(batch_size, sequence_length, vocab_size)
 
-            predict_logits = logits[:, context_length-1 : 1]
+            predict_logits = logits[:, context_length-1 : -1]
             predict_logits /= (1.0+1e-7)
             log_probs = F.log_softmax(predict_logits, dim=-1)
             log_probs = log_probs.gather(2, response_ids_subbatch.unsqueeze(-1)).squeeze(-1)
@@ -409,7 +420,7 @@ class PPOTrainer:
             )
             ref_logits = ref_output.logits
 
-            ref_predict_logits = ref_logits[:, context_length-1 : 1]
+            ref_predict_logits = ref_logits[:, context_length-1 : -1]
             ref_predict_logits /= (1.0+1e-7)
             ref_log_probs = F.log_softmax(ref_predict_logits, dim=-1)
             ref_log_probs = ref_log_probs.gather(2, response_ids_subbatch.unsqueeze(-1)).squeeze(-1)
@@ -440,8 +451,9 @@ class PPOTrainer:
             value_output = self.model.value_head(hidden_states)  # (batch_size, seq_len, 1)
             values = value_output.squeeze(-1)  # (batch_size, seq_len)
             response_values = values[:, context_length:]
-            return values
-    def _batch_process_samples(self, prompt_response_ids, responses_ids, postprocessed_responses_ids, attention_mask, context_length):
+            return response_values
+        
+    def _batch_process_samples(self, prompt_response_ids, responses_ids, postprocessed_responses_ids, attention_mask, context_length, answers):
         """
         批量处理样本
         Args:
@@ -465,18 +477,38 @@ class PPOTrainer:
             responses_ids_subbatch = responses_ids[i].unsqueeze(0)
             postprocessed_responses_ids_subbatch = postprocessed_responses_ids[i].unsqueeze(0)
             attention_mask_subbatch = attention_mask[i].unsqueeze(0)
+            current_answer = [answers[i] if answers and i < len(answers) else None]
 
             # 计算各种概率和分数
-            logprobs = self._compute_policy_log_probs() # to be updated.    
-            ref_logprobs = self._compute_ref_log_probs()
-            values = self._compute_values()
+            logprobs = self._compute_policy_log_probs(
+                prompt_response_ids_subbatch,
+                attention_mask_subbatch,
+                responses_ids_subbatch,
+                context_length,
+            ) # to be updated.    
+            ref_logprobs = self._compute_ref_log_probs(
+                prompt_response_ids_subbatch,
+                attention_mask_subbatch,
+                responses_ids_subbatch,
+                context_length,
+            )
+            values = self._compute_values(
+                prompt_response_ids_subbatch,
+                attention_mask_subbatch,
+                context_length,
+            )
 
             # 计算reward
             postprocessed_prompt_response_ids = torch.cat([
                 prompt_response_ids_subbatch[:, :context_length],
                 postprocessed_responses_ids_subbatch,
             ], dim = 1)
-            scores = self._compute_reward_scores()
+            
+            scores = self._compute_reward_scores(
+                postprocessed_prompt_response_ids,
+                context_length,
+                current_answer,
+            )
 
             logprobs_list.append(logprobs)
             if ref_logprobs is not None:
@@ -486,7 +518,7 @@ class PPOTrainer:
 
         return logprobs_list, ref_logprobs_list, values_list, scores_list
     
-    def _compute_reward_scores(self, postprocessed_prompt_response_ids, context_length):
+    def _compute_reward_scores(self, postprocessed_prompt_response_ids, context_length, answers=None):
         """
         计算奖励分数
         Args:
@@ -495,3 +527,71 @@ class PPOTrainer:
         Returns:
             scores: 奖励分数
         """
+        response_texts = []
+        prompt_texts = []
+
+        for i in range(postprocessed_prompt_response_ids.shape[0]):
+            # 提取prompt部分
+            prompt_ids = postprocessed_prompt_response_ids[i, :context_length]
+            prompt_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
+            prompt_texts.append(prompt_text)
+
+            # 提取response部分
+            response_ids = postprocessed_prompt_response_ids[i, context_length:]
+            response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            response_texts.append(response_text)
+        
+        if answers is None:
+            answers = [None] * len(prompt_texts)
+        # 计算总奖励
+        total_rewards = torch.zeros(len(response_texts), device=self.args.device)
+
+        # 如果有奖励函数，则计算奖励
+        if hasattr(self, 'reward_funcs') and self.reward_funcs:
+            for i, reward_func in enumerate(self.reward_funcs):
+
+                reward_values = reward_func(
+                    prompts = prompt_texts,
+                    responses=response_texts,
+                    answers=answers
+                )
+
+                reward_tensor = torch.tensor(reward_values, device = self.args.device, dtype=torch.float)
+
+                if (hasattr(self.args, 'reward_weights') and self.args.reward_weights and len(self.args.reward_weights) == len(self.reward_funcs)):
+                    weights = self.args.reward_weights[i]
+                else:
+                    weights = [1.0] * len(self.reward_funcs)    
+                
+                total_rewards += weights * reward_tensor
+
+        return total_rewards
+    
+    def _compute_advantages_and_returns(self, values_list, scores_list, action_mask, gamma=0.99, lambd=0.95):
+        """
+        计算advantage和回报
+        Args:
+            values_list: 价值函数的输出
+            scores_list: 奖励分数
+            action_mask: 动作掩码
+        Returns:
+            advantages: 优势
+            returns: 回报
+        """
+        
+
+    def train(self):
+        for epoch in range(self.args.epoch):
+
+            for iteration in range(self.args.num_interations):
+                experiences = []
+
+                for batch_idx, batch in enumerate(self.train_dataloader):
+                    print(f"Epoch {epoch}, Iteration {iteration}, Batch {batch_idx}")
+                    samples = self.generate_samples(batch)
+
+                    # 计算advantage和reward
+                    advantages, returns = self.
+                    # experiences.extend(samples)
+
+                # self.experience_buffer.append(experiences))
