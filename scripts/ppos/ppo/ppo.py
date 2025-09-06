@@ -578,7 +578,21 @@ class PPOTrainer:
             advantages: 优势
             returns: 回报
         """
-        
+        batch_advantages = []
+        batch_returns = []
+
+        for i in range(len(values_list)):
+            values = values_list[i] # (1, response_length)
+            rewards = scores_list[i]
+            current_action_mask = action_mask[i:i+1] 
+
+            response_length = current_action_mask.sum().item()
+            reward_sequence = torch.zeros_like(values)
+            
+            if response_length > 0:
+                reward_sequence[0, response_length - 1] = rewards
+
+            
 
     def train(self):
         for epoch in range(self.args.epoch):
