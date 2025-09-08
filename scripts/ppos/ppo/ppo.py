@@ -24,7 +24,12 @@ class Samples:
     num_actions: Union[int, torch.Tensor] #有多少response token
     response_ids: torch.Tensor # response token ids
     total_length: torch.Tensor # prompt + response的长度
-
+    logprobs: List[torch.Tensor] # 动作log概率列表
+    ref_logprobs: List[torch.Tensor]
+    values: List[torch.Tensor]
+    rewards: List[torch.Tensor]
+    advantages: List[torch.Tensor]
+    returns: List[torch.Tensor]
 
 class PPOArgs:
     output_dir = './output'
@@ -40,6 +45,7 @@ class PPOArgs:
     gradient_accumulation_steps = 2 # gradient accumulation steps
     num_iterations = 3 # number of iterations
     batch_size = 1 # batch size
+    # ppo_epochs = 4
 
 class PPOTrainer:
     def __init__(self,
@@ -592,20 +598,177 @@ class PPOTrainer:
             if response_length > 0:
                 reward_sequence[0, response_length - 1] = rewards
 
-            
+            # 计算gae优势
+            advantages = torch.zeros_like(values)
+            returns = torch.zeros_like(values)
+
+            gae = 0
+            for t in reversed(range(response_length)):
+                if t == response_length - 1:
+                    next_value = 0
+                else:
+                    next_value = values[0, t + 1]
+
+                delta = reward_sequence[0, t] + gamma * next_value - values[0, t]
+                gae = delta + gamma * lambd * gae
+                advantages[0, t] = gae
+                returns[0, t] = gae + values[0, t]
+
+            batch_advantages.append(advantages)
+            batch_returns.append(returns)
+    
+        return batch_advantages, batch_returns
+
+    def _compute_policy_loss(self, current_logprobs, old_logprobs, advantages, action_mask):
+        """
+        计算策略损失
+        Args:
+            current_logprobs: 当前策略的log概率
+            old_logprobs: 旧策略的log概率
+            advantages: 优势
+            action_mask: 动作掩码
+        Returns:
+            policy_loss: 策略损失
+        """
+        # 计算重要性采样比率
+        log_ratio = current_logprobs - old_logprobs
+        ratio = torch.exp(log_ratio)
+
+        #ppo clipped objective
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1.0 - self.args.clip_eps, 1.0 + self.args.clip_eps) * advantages
+        policy_loss = -torch.min(surr1, surr2)
+        policy_loss = policy_loss * action_mask
+        
+        policy_loss = (policy_loss.sum(dim=1) / action_mask.sum(dim=1).clamp(min=1)).mean()
+        return policy_loss
+
+    def _compute_value_loss(self, current_values, old_values, returns, action_mask):
+        """
+        计算价值损失
+        Args:
+            current_values: 当前策略的价值
+            old_values: 旧策略的价值
+            returns: 回报
+            action_mask: 动作掩码
+        Returns:
+            value_loss: 价值损失
+        """
+        #clipped value loss
+        value_pred_clipped = old_values + (current_values - old_values).clamp(-self.args.clip_eps, self.args.clip_eps)
+
+        value_losses = (current_values - returns) ** 2 # mse loss
+        value_losses_clipped = (value_pred_clipped - returns) ** 2 # mse loss
+        value_loss = torch.max(value_losses, value_losses_clipped)
+        value_loss = value_loss * action_mask.float()
+        value_loss = (value_loss.sum(dim=1) / action_mask.sum(dim=1).clamp(min=1)).mean()
+       
+        return value_loss
+
+    def _compute_kl_divergence(self, current_logprobs, ref_logprobs, action_mask):
+        """
+        计算KL散度
+        Args:
+            current_logprobs: 当前策略的log概率
+            old_logprobs: 旧策略的log概率
+            action_mask: 动作掩码
+        Returns:
+            kl_divergence: KL散度
+        """
+        if ref_logprobs is None:
+            return 0.0
+        
+        log_ratio = current_logprobs - ref_logprobs
+        kl_divergence = log_ratio.exp() - 1 - log_ratio
+        kl_divergence = kl_divergence * action_mask.float()
+        kl_divergence = (kl_divergence.sum(dim=1) / action_mask.sum(dim=1).clamp(min=1)).mean()
+        return kl_divergence
 
     def train(self):
         for epoch in range(self.args.epoch):
-
-            for iteration in range(self.args.num_interations):
-                experiences = []
-
+            for iteration in range(self.args.num_iterations):
+                print(f"Epoch {epoch}, Iteration {iteration}")
+                
+                # 收集经验
+                all_samples = []
                 for batch_idx, batch in enumerate(self.train_dataloader):
-                    print(f"Epoch {epoch}, Iteration {iteration}, Batch {batch_idx}")
+                    print(f"Batch {batch_idx}")
                     samples = self.generate_samples(batch)
-
-                    # 计算advantage和reward
-                    advantages, returns = self.
-                    # experiences.extend(samples)
-
-                # self.experience_buffer.append(experiences))
+                    all_samples.append(samples)
+                
+                # PPO更新 - 直接对收集的样本进行一次更新
+                total_policy_loss = 0
+                total_value_loss = 0
+                total_kl_penalty = 0
+                
+                for samples in all_samples:
+                    self.model.train()
+                    
+                    # 重新计算当前策略的logprobs和values
+                    current_logprobs_list = []
+                    current_values_list = []
+                    
+                    for i in range(len(samples.logprobs)):
+                        # 重新计算当前logprobs
+                        current_logprobs = self._compute_policy_log_probs(
+                            samples.prompt_response_ids[i:i+1],
+                            samples.attention_mask[i:i+1],
+                            samples.response_ids[i:i+1],
+                            samples.prompt_response_ids.shape[1] - samples.response_ids.shape[1]
+                        )
+                        current_logprobs_list.append(current_logprobs)
+                        
+                        # 重新计算当前values
+                        current_values = self._compute_values(
+                            samples.prompt_response_ids[i:i+1],
+                            samples.attention_mask[i:i+1],
+                            samples.prompt_response_ids.shape[1] - samples.response_ids.shape[1]
+                        )
+                        current_values_list.append(current_values)
+                    
+                    # 计算损失
+                    policy_loss = 0
+                    value_loss = 0
+                    kl_penalty = 0
+                    
+                    for i in range(len(samples.logprobs)):
+                        # 策略损失
+                        policy_loss += self._compute_policy_loss(
+                            current_logprobs_list[i],
+                            samples.logprobs[i],
+                            samples.advantages[i],
+                            samples.action_mask[i:i+1]
+                        )
+                        
+                        # 价值损失
+                        value_loss += self._compute_value_loss(
+                            current_values_list[i],
+                            samples.values[i],
+                            samples.returns[i],
+                            samples.action_mask[i:i+1]
+                        )
+                        
+                        # KL惩罚
+                        if samples.ref_logprobs and samples.ref_logprobs[i] is not None:
+                            kl_penalty += self._compute_kl_penalty(
+                                current_logprobs_list[i],
+                                samples.ref_logprobs[i],
+                                samples.action_mask[i:i+1]
+                            )
+                    
+                    # 总损失
+                    total_loss = policy_loss + 0.5 * value_loss + kl_penalty
+                    
+                    # 反向传播
+                    self.accelerator.backward(total_loss)
+                    
+                    if (batch_idx + 1) % self.args.gradient_accumulation_steps == 0:
+                        self.optimizer.step()
+                        self.optimizer.zero_grad()
+                    
+                    total_policy_loss += policy_loss.item()
+                    total_value_loss += value_loss.item()
+                    total_kl_penalty += kl_penalty if isinstance(kl_penalty, float) else kl_penalty.item()
+                
+                print(f"Iteration {iteration}: Policy Loss: {total_policy_loss:.4f}, "
+                      f"Value Loss: {total_value_loss:.4f}, KL Penalty: {total_kl_penalty:.4f}")
